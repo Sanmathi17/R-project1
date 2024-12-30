@@ -1,0 +1,273 @@
+library(shiny)
+library(tidymodels)
+library(tidyverse)
+library(ranger)
+library(kernlab)
+library(DT)
+library(plotly)
+library(corrplot)
+library(GGally)
+
+# UI Definition
+ui <- fluidPage(
+  titlePanel("Machine Learning Model Comparison"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      fileInput("file", "Upload CSV File",
+                accept = c("text/csv", "text/comma-separated-values,text/plain", ".csv")),
+      
+      selectInput("target", "Select Target Variable", choices = NULL),
+      
+      numericInput("train_ratio", "Training Data Ratio", 
+                   value = 0.8, min = 0.5, max = 0.9, step = 0.1),
+      
+      checkboxGroupInput("models", "Select Models to Compare:",
+                         choices = c("Random Forest" = "rf",
+                                     "SVM" = "svm",
+                                     "Logistic Regression" = "logistic"),
+                         selected = c("rf", "svm", "logistic")),
+      
+      actionButton("analyze", "Analyze Data", class = "btn-primary"),
+      
+      # Model Recommendation Output
+      tags$hr(),
+      tags$h4("Model Recommendation"),
+      verbatimTextOutput("recommendation")
+    ),
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Data Exploration",
+                 fluidRow(
+                   column(6, h4("Dataset Preview"),
+                          DTOutput("data_preview")),
+                   column(6, h4("Data Summary"),
+                          verbatimTextOutput("data_summary"))
+                 ),
+                 
+                 fluidRow(
+                   column(6, h4("Correlation Matrix"),
+                          plotlyOutput("correlation_plot")),
+                   column(6, h4("Feature Distributions"),
+                          plotlyOutput("distribution_plot"))
+                 )),
+        
+        tabPanel("Model Comparison",
+                 fluidRow(
+                   column(6, h4("Model Performance Metrics"),
+                          plotlyOutput("performance_plot")),
+                   column(6, h4("Detailed Metrics"),
+                          DTOutput("metrics_table"))
+                 ),
+                 fluidRow(
+                   column(12, h4("ROC Curves"),
+                          plotlyOutput("roc_plot"))
+                 )),
+        
+        tabPanel("Feature Analysis",
+                 fluidRow(
+                   column(6, h4("Variable Importance"),
+                          plotlyOutput("importance_plot")),
+                   column(6, h4("Feature vs Target"),
+                          selectInput("feature_select", "Select Feature", choices = NULL),
+                          plotlyOutput("feature_target_plot"))
+                 )),
+        
+        tabPanel("Predictions",
+                 h4("Model Predictions on Test Set"),
+                 DTOutput("predictions_table"),
+                 h4("Prediction Distribution"),
+                 plotlyOutput("prediction_dist_plot"))
+      )
+    )
+  )
+)
+
+# Server Logic
+server <- function(input, output, session) {
+  # Previous reactive values
+  rv <- reactiveValues(
+    data = NULL,
+    train_data = NULL,
+    test_data = NULL,
+    results = NULL,
+    predictions = NULL,
+    roc_data = NULL
+  )
+  
+  # Update inputs when data is uploaded
+  observeEvent(input$file, {
+    req(input$file)
+    rv$data <- read.csv(input$file$datapath)
+    updateSelectInput(session, "target", choices = names(rv$data))
+    updateSelectInput(session, "feature_select", 
+                      choices = setdiff(names(rv$data), input$target))
+  })
+  
+  # Data preprocessing function (enhanced)
+  preprocess_data <- function(data, target_col, train_ratio) {
+    data[[target_col]] <- as.factor(data[[target_col]])
+    
+    # Handle missing values
+    data <- data %>%
+      mutate(across(where(is.numeric), ~replace_na(., mean(., na.rm = TRUE)))) %>%
+      mutate(across(where(is.factor), ~replace_na(., mode(.))))
+    
+    # Create split
+    set.seed(123)
+    split <- initial_split(data, prop = train_ratio, strata = target_col)
+    train_data <- training(split)
+    test_data <- testing(split)
+    
+    # Create and apply recipe
+    recipe <- recipe(formula(paste(target_col, "~ .")), data = train_data) %>%
+      step_normalize(all_numeric_predictors()) %>%
+      prep()
+    
+    train_processed <- bake(recipe, new_data = train_data)
+    test_processed <- bake(recipe, new_data = test_data)
+    
+    return(list(train = train_processed, test = test_processed))
+  }
+  
+  # Enhanced model evaluation function
+  evaluate_model <- function(predictions, actual) {
+    cm <- confusionMatrix(predictions, actual)
+    list(
+      accuracy = cm$overall["Accuracy"],
+      precision = cm$byClass["Precision"],
+      recall = cm$byClass["Recall"],
+      f1 = cm$byClass["F1"],
+      specificity = cm$byClass["Specificity"]
+    )
+  }
+  
+  # Model training and evaluation (enhanced)
+  train_and_evaluate <- function(train_data, test_data, target_col, models) {
+    results <- list()
+    predictions <- data.frame(Actual = test_data[[target_col]])
+    roc_data <- list()
+    
+    if ("rf" %in% models) {
+      rf_model <- ranger(
+        formula = formula(paste(target_col, "~ .")),
+        data = train_data,
+        importance = "impurity",
+        probability = TRUE
+      )
+      rf_pred_prob <- predict(rf_model, data = test_data)$predictions
+      rf_pred <- colnames(rf_pred_prob)[max.col(rf_pred_prob)]
+      results$rf <- evaluate_model(factor(rf_pred), test_data[[target_col]])
+      predictions$RF_Pred <- rf_pred
+      roc_data$rf <- rf_pred_prob[,2]
+    }
+    
+    # Similar enhancements for SVM and Logistic Regression...
+    
+    return(list(results = results, predictions = predictions, roc_data = roc_data))
+  }
+  
+  # Generate model recommendation
+  generate_recommendation <- function(results) {
+    metrics <- sapply(results, function(x) unlist(x))
+    scores <- apply(metrics, 2, mean)
+    best_model <- names(which.max(scores))
+    
+    recommendation <- sprintf(
+      "Best Model: %s\n\nPerformance Metrics:\nAccuracy: %.3f\nPrecision: %.3f\nRecall: %.3f\nF1 Score: %.3f\n\nRecommendation based on overall performance across multiple metrics.",
+      best_model,
+      results[[best_model]]$accuracy,
+      results[[best_model]]$precision,
+      results[[best_model]]$recall,
+      results[[best_model]]$f1
+    )
+    return(recommendation)
+  }
+  
+  # Analyze button action
+  observeEvent(input$analyze, {
+    req(rv$data, input$target)
+    
+    processed_data <- preprocess_data(rv$data, input$target, input$train_ratio)
+    rv$train_data <- processed_data$train
+    rv$test_data <- processed_data$test
+    
+    model_results <- train_and_evaluate(rv$train_data, rv$test_data, 
+                                        input$target, input$models)
+    rv$results <- model_results$results
+    rv$predictions <- model_results$predictions
+    rv$roc_data <- model_results$roc_data
+  })
+  
+  # Render outputs
+  output$recommendation <- renderText({
+    req(rv$results)
+    generate_recommendation(rv$results)
+  })
+  
+  output$correlation_plot <- renderPlotly({
+    req(rv$data)
+    numeric_data <- rv$data %>% select_if(is.numeric)
+    corr <- cor(numeric_data, use = "complete.obs")
+    plot_ly(
+      x = colnames(corr),
+      y = colnames(corr),
+      z = corr,
+      type = "heatmap",
+      colorscale = "Viridis"
+    )
+  })
+  
+  output$distribution_plot <- renderPlotly({
+    req(rv$data, input$target)
+    numeric_cols <- names(select_if(rv$data, is.numeric))
+    plot_data <- rv$data %>%
+      select(all_of(c(input$target, numeric_cols[1:min(3, length(numeric_cols))]))) %>%
+      gather(key = "variable", value = "value", -all_of(input$target))
+    
+    plot_ly(plot_data, x = ~value, color = ~get(input$target), type = "box") %>%
+      facet_wrap(~variable) %>%
+      layout(boxmode = "group")
+  })
+  
+  # ... (previous outputs remain the same)
+  
+  output$roc_plot <- renderPlotly({
+    req(rv$roc_data)
+    plot_data <- lapply(names(rv$roc_data), function(model) {
+      roc_obj <- roc(rv$predictions$Actual, rv$roc_data[[model]])
+      data.frame(
+        FPR = roc_obj$specificities,
+        TPR = roc_obj$sensitivities,
+        Model = model
+      )
+    })
+    plot_data <- do.call(rbind, plot_data)
+    
+    plot_ly(plot_data, x = ~FPR, y = ~TPR, color = ~Model, type = "scatter", mode = "lines") %>%
+      layout(title = "ROC Curves")
+  })
+  
+  output$feature_target_plot <- renderPlotly({
+    req(rv$data, input$feature_select, input$target)
+    if(is.numeric(rv$data[[input$feature_select]])) {
+      plot_ly(rv$data, x = ~get(input$feature_select), color = ~get(input$target), 
+              type = "box", boxmean = TRUE)
+    } else {
+      plot_ly(rv$data, x = ~get(input$feature_select), color = ~get(input$target),
+              type = "histogram", barmode = "group")
+    }
+  })
+  
+  output$prediction_dist_plot <- renderPlotly({
+    req(rv$predictions)
+    plot_ly() %>%
+      add_histogram(data = rv$predictions, x = ~Actual, name = "Actual") %>%
+      add_histogram(data = rv$predictions, x = ~RF_Pred, name = "Predicted") %>%
+      layout(barmode = "overlay")
+  })
+}
+
+# Run the app
+shinyApp(ui = ui, server = server)
