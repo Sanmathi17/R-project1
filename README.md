@@ -1,1 +1,1 @@
-# r-project1
+This Shiny app allows users to upload a dataset, select a target variable, and compare the performance of various machine learning models such as Random Forest, SVM, and Logistic Regression. It visualizes model accuracy, feature importance, and predictions on the test set for easy comparison and analysis.
